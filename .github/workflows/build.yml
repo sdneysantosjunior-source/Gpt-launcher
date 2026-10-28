@@ -21,11 +21,195 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Instalar Android SDK e build-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_DIR="$HOME/android-sdk"
+          mkdir -p "$SDK_DIR"
+
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+
+          export ANDROID_HOME="$SDK_DIR"
+          export ANDROID_SDK_ROOT="$SDK_DIR"
+
+          if [ ! -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "Baixando ferramentas oficiais do Android..."
+            curl -fsSL \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+              -o /tmp/cmdline-tools.zip
+
+            rm -rf /tmp/android_cmdline
+            mkdir -p /tmp/android_cmdline
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/android_cmdline
+
+            mkdir -p "$SDK_DIR/cmdline-tools"
+            rm -rf "$SDK_DIR/cmdline-tools/latest"
+
+            if [ -d /tmp/android_cmdline/cmdline-tools ]; then
+              mv /tmp/android_cmdline/cmdline-tools \
+                "$SDK_DIR/cmdline-tools/latest"
+            else
+              mkdir -p "$SDK_DIR/cmdline-tools/latest"
+              cp -a /tmp/android_cmdline/. \
+                "$SDK_DIR/cmdline-tools/latest/"
+            fi
+          fi
+
+          SDKMANAGER="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$SDK_DIR" --licenses >/dev/null
+
+          "$SDKMANAGER" --sdk_root="$SDK_DIR" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          test -x "$SDK_DIR/build-tools/35.0.0/aapt"
+          test -x "$SDK_DIR/build-tools/35.0.0/dexdump"
+
+          echo "Android SDK instalado em: $SDK_DIR"
+
       - name: Configurar Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Compilar APK
-        run: gradle assembleDebug
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SDK utilizado: $ANDROID_HOME"
+          gradle --no-daemon assembleDebug
+
+      - name: Verificar APK, manifesto e classe Java
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          DEXDUMP="$ANDROID_HOME/build-tools/35.0.0/dexdump"
+
+          if [ ! -f "$APK" ]; then
+            echo "::error::APK não encontrado: $APK"
+            exit 1
+          fi
+
+          echo "=== Tamanho do APK ==="
+          stat -c '%s bytes' "$APK"
+
+          echo "=== Conteúdo do APK ==="
+          unzip -l "$APK"
+
+          for required in \
+            classes.dex \
+            AndroidManifest.xml \
+            resources.arsc; do
+            if ! unzip -Z1 "$APK" | grep -Fxq "$required"; then
+              echo "::error::Arquivo obrigatório ausente: $required"
+              exit 1
+            fi
+          done
+
+          echo "=== Verificando pacote e Activity ==="
+          "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
+
+          grep -Fq "package: name='com.liquidglass.launcher'" \
+            /tmp/badging.txt || {
+              echo "::error::Pacote incorreto ou ausente"
+              exit 1
+            }
+
+          grep -Fq \
+            "launchable-activity: name='com.liquidglass.launcher.MainActivity'" \
+            /tmp/badging.txt || {
+              echo "::error::Activity principal não confirmada"
+              exit 1
+            }
+
+          echo "=== Verificando filtros da MainActivity ==="
+          "$AAPT" dump xmltree "$APK" AndroidManifest.xml \
+            > /tmp/manifest-tree.txt
+
+          python3 - /tmp/manifest-tree.txt <<'PY'
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    lines = f.read().splitlines()
+
+blocks = []
+i = 0
+
+while i < len(lines):
+    if lines[i].lstrip().startswith("E: activity "):
+        start = i
+        indent = len(lines[i]) - len(lines[i].lstrip())
+        i += 1
+
+        while i < len(lines):
+            stripped = lines[i].lstrip()
+            current_indent = len(lines[i]) - len(stripped)
+
+            if current_indent == indent and (
+                stripped.startswith("E: activity ")
+                or stripped.startswith("E: application ")
+            ):
+                break
+            i += 1
+
+        blocks.append("\n".join(lines[start:i]))
+    else:
+        i += 1
+
+activity = next(
+    (
+        block for block in blocks
+        if ".MainActivity" in block
+        or "com.liquidglass.launcher.MainActivity" in block
+    ),
+    None,
+)
+
+if activity is None:
+    print("::error::MainActivity não encontrada no manifesto compilado")
+    raise SystemExit(1)
+
+required = [
+    "android.intent.action.MAIN",
+    "android.intent.category.HOME",
+    "android.intent.category.DEFAULT",
+    "android.intent.category.LEANBACK_LAUNCHER",
+]
+
+for item in required:
+    if item not in activity:
+        print(f"::error::Filtro ausente na MainActivity: {item}")
+        raise SystemExit(1)
+
+print("MainActivity encontrada com os filtros MAIN, HOME, DEFAULT e LEANBACK_LAUNCHER.")
+PY
+
+          echo "=== Verificando classes.dex ==="
+          unzip -p "$APK" classes.dex > /tmp/classes.dex
+
+          if [ ! -s /tmp/classes.dex ]; then
+            echo "::error::classes.dex está vazio"
+            exit 1
+          fi
+
+          "$DEXDUMP" -d /tmp/classes.dex > /tmp/dexdump.txt
+
+          if ! grep -Fq \
+            'Lcom/liquidglass/launcher/MainActivity;' \
+            /tmp/dexdump.txt; then
+            echo "::error::MainActivity não encontrada no DEX"
+            exit 1
+          fi
+
+          echo "Classe MainActivity confirmada no DEX."
+          echo "=== Todas as verificações passaram ==="
 
       - name: Disponibilizar APK
         uses: actions/upload-artifact@v4
