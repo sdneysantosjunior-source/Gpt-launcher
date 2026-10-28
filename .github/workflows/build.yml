@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Baixar código do projeto
+      - name: Baixar projeto
         uses: actions/checkout@v4
 
       - name: Configurar Java 17
@@ -44,14 +44,26 @@ jobs:
           mv /tmp/android-tools/cmdline-tools \
             "$ANDROID_HOME/cmdline-tools/latest"
 
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "::error::sdkmanager não foi encontrado no caminho esperado."
+            find "$ANDROID_HOME/cmdline-tools" -maxdepth 4 -type f
+            exit 1
+          fi
 
-          sdkmanager \
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          "$SDKMANAGER" --version
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
@@ -60,61 +72,34 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Compilar aplicativo
-        shell: bash
-        run: |
-          set -e
-          gradle --no-daemon assembleDebug
+        run: gradle --no-daemon assembleDebug
 
-      - name: Verificar APK gerado
+      - name: Verificar APK
         shell: bash
         run: |
           set -e
 
           APK="app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "::error::O APK não foi gerado."
-            exit 1
-          fi
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
 
           if [ ! -s "$APK" ]; then
-            echo "::error::O arquivo APK está vazio."
+            echo "::error::APK ausente ou vazio."
             exit 1
           fi
 
           unzip -t "$APK"
 
-          unzip -l "$APK" | grep -q "classes.dex" || {
-            echo "::error::O APK não contém classes.dex."
-            exit 1
-          }
-
-          unzip -l "$APK" | grep -q "AndroidManifest.xml" || {
-            echo "::error::O APK não contém AndroidManifest.xml."
-            exit 1
-          }
-
-          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          unzip -l "$APK" | grep -q "classes.dex"
+          unzip -l "$APK" | grep -q "AndroidManifest.xml"
 
           "$AAPT" dump badging "$APK" > /tmp/apk-info.txt
 
-          grep -Fq "package: name='com.liquidglass.launcher'" \
-            /tmp/apk-info.txt || {
-            echo "::error::O pacote do aplicativo não corresponde ao esperado."
-            cat /tmp/apk-info.txt
-            exit 1
-          }
+          grep -Fq "package: name='com.liquidglass.launcher'" /tmp/apk-info.txt
+          grep -Fq "com.liquidglass.launcher.MainActivity" /tmp/apk-info.txt
 
-          grep -Fq "com.liquidglass.launcher.MainActivity" \
-            /tmp/apk-info.txt || {
-            echo "::error::A atividade principal não foi identificada no manifesto."
-            cat /tmp/apk-info.txt
-            exit 1
-          }
+          echo "Verificações do APK concluídas."
 
-          echo "APK gerado e verificações básicas concluídas."
-
-      - name: Disponibilizar APK para download
+      - name: Disponibilizar APK
         uses: actions/upload-artifact@v4
         with:
           name: LiquidGlass-debug-apk
